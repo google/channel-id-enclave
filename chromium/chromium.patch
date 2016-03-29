@@ -1,0 +1,1405 @@
+From aaa3db2efb07f13a1735c78fea90c13ca609796e Mon Sep 17 00:00:00 2001
+From: Erica Portnoy <ebp@chromium.org>
+Date: Tue, 29 Mar 2016 13:19:41 -0700
+Subject: [PATCH] Functioning SGX Private Key PoC based on
+ f594a1085b49369c2479e5526dd0ef8b116e9af0
+
+---
+ build/config/linux/BUILD.gn                        |   4 +
+ crypto/ec_private_key.h                            |  16 +-
+ crypto/ec_private_key_openssl.cc                   |  98 ++++++++++-
+ net/BUILD.gn                                       |  11 +-
+ net/base/net_error_list.h                          |   3 +
+ net/log/net_log_event_type_list.h                  |   6 +
+ net/net.gypi                                       |   4 +
+ net/socket/ssl_client_socket_openssl.cc            |  97 +++++++++++
+ net/socket/ssl_client_socket_openssl.h             |   4 +
+ net/ssl/Makefile                                   |  92 +++++++++++
+ .../channel_id_enclave/channel_id_key_manager.c    | 101 ++++++++++++
+ .../channel_id_key_manager.config.xml              |  11 ++
+ .../channel_id_enclave/channel_id_key_manager.edl  |  22 +++
+ .../channel_id_enclave/channel_id_key_manager.lds  |  13 ++
+ .../channel_id_key_manager_private.pem             |  39 +++++
+ net/ssl/channel_id_service.cc                      | 181 ++++++++++++++++++++-
+ net/ssl/channel_id_service.h                       |  27 ++-
+ net/ssl/channel_id_service_unittest.cc             |  36 ++++
+ net/ssl/sgx_util.cc                                |  83 ++++++++++
+ net/ssl/sgx_util.h                                 |  30 ++++
+ tools/metrics/histograms/histograms.xml            |   7 +
+ 21 files changed, 877 insertions(+), 8 deletions(-)
+ create mode 100644 net/ssl/Makefile
+ create mode 100644 net/ssl/channel_id_enclave/channel_id_key_manager.c
+ create mode 100644 net/ssl/channel_id_enclave/channel_id_key_manager.config.xml
+ create mode 100644 net/ssl/channel_id_enclave/channel_id_key_manager.edl
+ create mode 100644 net/ssl/channel_id_enclave/channel_id_key_manager.lds
+ create mode 100644 net/ssl/channel_id_enclave/channel_id_key_manager_private.pem
+ create mode 100644 net/ssl/sgx_util.cc
+ create mode 100644 net/ssl/sgx_util.h
+
+diff --git a/build/config/linux/BUILD.gn b/build/config/linux/BUILD.gn
+index a19b8f1..577b398 100644
+--- a/build/config/linux/BUILD.gn
++++ b/build/config/linux/BUILD.gn
+@@ -37,6 +37,10 @@ pkg_config("freetype2") {
+   packages = [ "freetype2" ]
+ }
+ 
++pkg_config("sgx") {
++  packages = [ "sgx" ]
++}
++
+ pkg_config("glib") {
+   packages = [
+     "glib-2.0",
+diff --git a/crypto/ec_private_key.h b/crypto/ec_private_key.h
+index 9a8a02a..b7d6daf 100644
+--- a/crypto/ec_private_key.h
++++ b/crypto/ec_private_key.h
+@@ -8,6 +8,8 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ 
++#include <memory>
++#include <openssl/ec.h>
+ #include <string>
+ #include <vector>
+ 
+@@ -46,7 +48,7 @@ class CRYPTO_EXPORT ECPrivateKey {
+   // The key pair is given as an ASN.1-encoded PKCS #8 EncryptedPrivateKeyInfo
+   // block and an X.509 SubjectPublicKeyInfo block.
+   // Returns NULL if initialization fails.
+-  static ECPrivateKey* CreateFromEncryptedPrivateKeyInfo(
++  static ECPrivateKey*  CreateFromEncryptedPrivateKeyInfo(
+       const std::string& password,
+       const std::vector<uint8_t>& encrypted_private_key_info,
+       const std::vector<uint8_t>& subject_public_key_info);
+@@ -66,6 +68,12 @@ class CRYPTO_EXPORT ECPrivateKey {
+       bool sensitive,
+       SECKEYPrivateKey** key,
+       SECKEYPublicKey** public_key);
++#else
++  // Makes a private copy of the public key
++  static ECPrivateKey* CreateFromKeyBlobAndPublicKey(
++      uint8_t *sealed_key,
++      uint32_t sealed_key_size,
++      EC_KEY *public_key);
+ #endif
+ 
+   // Returns a copy of the object.
+@@ -73,6 +81,9 @@ class CRYPTO_EXPORT ECPrivateKey {
+ 
+ #if defined(USE_OPENSSL)
+   EVP_PKEY* key() { return key_; }
++  uint8_t *key_blob() { return key_blob_; }
++  uint32_t key_blob_size() {return key_blob_size_; }
++  EVP_PKEY* public_key() { return public_key_; }
+ #else
+   SECKEYPrivateKey* key() { return key_; }
+   SECKEYPublicKey* public_key() { return public_key_; }
+@@ -104,6 +115,9 @@ class CRYPTO_EXPORT ECPrivateKey {
+ 
+ #if defined(USE_OPENSSL)
+   EVP_PKEY* key_;
++  uint8_t* key_blob_;
++  uint32_t key_blob_size_;
++  EVP_PKEY* public_key_;
+ #else
+   SECKEYPrivateKey* key_;
+   SECKEYPublicKey* public_key_;
+diff --git a/crypto/ec_private_key_openssl.cc b/crypto/ec_private_key_openssl.cc
+index d896203..07fe8cc 100644
+--- a/crypto/ec_private_key_openssl.cc
++++ b/crypto/ec_private_key_openssl.cc
+@@ -4,18 +4,23 @@
+ 
+ #include "crypto/ec_private_key.h"
+ 
++#include <iostream>
++
+ #include <openssl/ec.h>
+ #include <openssl/evp.h>
+ #include <openssl/pkcs12.h>
+ #include <openssl/x509.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <stdio.h>
+ 
+ #include "base/logging.h"
+ #include "base/memory/scoped_ptr.h"
+ #include "crypto/openssl_util.h"
+ #include "crypto/scoped_openssl_types.h"
+ 
++#define SGX_ENABLE
++
+ namespace crypto {
+ 
+ namespace {
+@@ -85,12 +90,28 @@ bool ExportKey(const void* key,
+ ECPrivateKey::~ECPrivateKey() {
+   if (key_)
+     EVP_PKEY_free(key_);
++  if (public_key_) {
++    EVP_PKEY_free(public_key_);
++  }
++  if (key_blob_)
++    free(key_blob_);
+ }
+ 
+ ECPrivateKey* ECPrivateKey::Copy() const {
+   scoped_ptr<ECPrivateKey> copy(new ECPrivateKey);
+   if (key_)
+     copy->key_ = EVP_PKEY_up_ref(key_);
++
++  if (public_key_)
++    copy->public_key_ = EVP_PKEY_up_ref(public_key_);
++
++  if (key_blob_) {
++    copy->key_blob_size_ = key_blob_size_;
++    copy->key_blob_ = (uint8_t *)calloc(key_blob_size_, sizeof(uint8_t));
++    if (!copy->key_blob_) return NULL;
++    memcpy(copy->key_blob_, key_blob_, key_blob_size_);
++  }
++
+   return copy.release();
+ }
+ 
+@@ -112,6 +133,29 @@ ECPrivateKey* ECPrivateKey::Create() {
+ }
+ 
+ // static
++ECPrivateKey* ECPrivateKey::CreateFromKeyBlobAndPublicKey(
++    uint8_t *sealed_key,
++    uint32_t sealed_key_size,
++    EC_KEY *public_key) {
++  OpenSSLErrStackTracer err_tracer(FROM_HERE);
++
++  scoped_ptr<ECPrivateKey> result(new ECPrivateKey());
++
++  result->key_blob_ = (uint8_t *)calloc(sealed_key_size, sizeof(uint8_t));
++  if (!result->key_blob_) return NULL;
++  memcpy(result->key_blob_, sealed_key, sealed_key_size);
++
++  result->key_blob_size_ = sealed_key_size;
++
++  result->public_key_ = EVP_PKEY_new();
++  if (!result->public_key_ ||
++      !EVP_PKEY_set1_EC_KEY(result->public_key_, public_key))
++    return NULL;
++
++  return result.release();
++}
++
++// static
+ ECPrivateKey* ECPrivateKey::CreateFromEncryptedPrivateKeyInfo(
+     const std::string& password,
+     const std::vector<uint8_t>& encrypted_private_key_info,
+@@ -124,6 +168,32 @@ ECPrivateKey* ECPrivateKey::CreateFromEncryptedPrivateKeyInfo(
+ 
+   OpenSSLErrStackTracer err_tracer(FROM_HERE);
+ 
++#ifdef SGX_ENABLE
++  // encrypted_private_key_info will be the key blob
++  uint8_t *sealed_key = (uint8_t *)&encrypted_private_key_info[0];
++  uint32_t sealed_key_len = encrypted_private_key_info.size();
++
++  // turn subject_public_key_info into an EC KEY
++  size_t input_size = subject_public_key_info.size();
++  uint8_t *input_arr = (uint8_t *)&subject_public_key_info[0];
++  BIO *bio = BIO_new_mem_buf(input_arr, input_size);
++  if (!bio)
++    return NULL;
++  EVP_PKEY *evp_pubkey = d2i_PUBKEY_bio(bio, NULL);
++  if (!evp_pubkey) {
++    BIO_free(bio);
++    return NULL;
++  }
++  // gets reference without incrementing reference count
++  EC_KEY *public_key = EVP_PKEY_get0_EC_KEY(evp_pubkey);
++  ECPrivateKey *out = CreateFromKeyBlobAndPublicKey(sealed_key,
++      sealed_key_len, public_key);
++
++  EVP_PKEY_free(evp_pubkey);
++  BIO_free(bio);
++  return out;
++#endif
++
+   const uint8_t* data = &encrypted_private_key_info[0];
+   const uint8_t* ptr = data;
+   ScopedX509_SIG p8_encrypted(
+@@ -152,6 +222,7 @@ ECPrivateKey* ECPrivateKey::CreateFromEncryptedPrivateKeyInfo(
+ 
+   // Create a new EVP_PKEY for it.
+   scoped_ptr<ECPrivateKey> result(new ECPrivateKey);
++
+   result->key_ = EVP_PKCS82PKEY(p8_decrypted.get());
+   if (!result->key_ || EVP_PKEY_type(result->key_->type) != EVP_PKEY_EC)
+     return NULL;
+@@ -163,6 +234,13 @@ bool ECPrivateKey::ExportEncryptedPrivateKey(const std::string& password,
+                                              int iterations,
+                                              std::vector<uint8_t>* output) {
+   OpenSSLErrStackTracer err_tracer(FROM_HERE);
++  if (public_key_) {
++    // If the key was generated with SGX, it's already encrypted;
++    // put it directly into output.
++    output->insert(output->end(), &key_blob_[0], &key_blob_[key_blob_size_]);
++    return true;
++  }
++
+   // Convert into a PKCS#8 object.
+   ScopedPKCS8_PRIV_KEY_INFO pkcs8(EVP_PKEY2PKCS8(key_));
+   if (!pkcs8.get())
+@@ -192,6 +270,10 @@ bool ECPrivateKey::ExportEncryptedPrivateKey(const std::string& password,
+ 
+ bool ECPrivateKey::ExportPublicKey(std::vector<uint8_t>* output) {
+   OpenSSLErrStackTracer err_tracer(FROM_HERE);
++  if (public_key_)
++    return ExportKeyWithBio(
++        public_key_,
++        reinterpret_cast<ExportBioFunction>(i2d_PUBKEY_bio), output);
+   return ExportKeyWithBio(
+       key_, reinterpret_cast<ExportBioFunction>(i2d_PUBKEY_bio), output);
+ }
+@@ -200,15 +282,19 @@ bool ECPrivateKey::ExportRawPublicKey(std::string* output) {
+   // i2d_PublicKey will produce an ANSI X9.62 public key which, for a P-256
+   // key, is 0x04 (meaning uncompressed) followed by the x and y field
+   // elements as 32-byte, big-endian numbers.
++  EVP_PKEY *key = key_;
++  if (public_key_)
++    key = public_key_;
++
+   static const int kExpectedKeyLength = 65;
+ 
+-  int len = i2d_PublicKey(key_, NULL);
++  int len = i2d_PublicKey(key, NULL);
+   if (len != kExpectedKeyLength)
+     return false;
+ 
+   uint8_t buf[kExpectedKeyLength];
+   uint8_t* derp = buf;
+-  len = i2d_PublicKey(key_, &derp);
++  len = i2d_PublicKey(key, &derp);
+   if (len != kExpectedKeyLength)
+     return false;
+ 
+@@ -218,6 +304,9 @@ bool ECPrivateKey::ExportRawPublicKey(std::string* output) {
+ 
+ bool ECPrivateKey::ExportValue(std::vector<uint8_t>* output) {
+   OpenSSLErrStackTracer err_tracer(FROM_HERE);
++  if (public_key_)
++    return false;
++
+   ScopedEC_KEY ec_key(EVP_PKEY_get1_EC_KEY(key_));
+   return ExportKey(ec_key.get(),
+                    reinterpret_cast<ExportDataFunction>(i2d_ECPrivateKey),
+@@ -226,12 +315,15 @@ bool ECPrivateKey::ExportValue(std::vector<uint8_t>* output) {
+ 
+ bool ECPrivateKey::ExportECParams(std::vector<uint8_t>* output) {
+   OpenSSLErrStackTracer err_tracer(FROM_HERE);
++  if (public_key_)
++    return false;
++
+   ScopedEC_KEY ec_key(EVP_PKEY_get1_EC_KEY(key_));
+   return ExportKey(ec_key.get(),
+                    reinterpret_cast<ExportDataFunction>(i2d_ECParameters),
+                    output);
+ }
+ 
+-ECPrivateKey::ECPrivateKey() : key_(NULL) {}
++ECPrivateKey::ECPrivateKey() : key_(NULL), key_blob_(NULL), public_key_(NULL) {}
+ 
+ }  // namespace crypto
+diff --git a/net/BUILD.gn b/net/BUILD.gn
+index 129003a..6f225ad 100644
+--- a/net/BUILD.gn
++++ b/net/BUILD.gn
+@@ -104,6 +104,10 @@ net_shared_configs = [
+   "//build/config/compiler:no_size_t_to_int_warning",
+ ]
+ 
++if (is_linux) {
++  net_shared_configs += [ "//build/config/linux:sgx" ]
++}
++
+ net_shared_public_deps = [
+   ":features",
+   ":net_quic_proto",
+@@ -266,7 +270,9 @@ if (!is_nacl) {
+   }
+ 
+   if (is_linux) {
+-    net_shared_configs += [ "//build/config/linux:libresolv" ]
++    net_shared_configs += [
++      "//build/config/linux:libresolv",
++    ]
+   }
+ 
+   if (!use_nss_certs) {
+@@ -402,6 +408,9 @@ component("net") {
+   cflags = []
+   configs += net_shared_configs
+   public_configs = [ ":net_config" ]
++  if (is_linux) {
++    public_configs += [ "//build/config/linux:sgx" ]
++  }
+ 
+   public_deps = net_shared_public_deps + [ "//url" ]
+   deps = net_shared_deps
+diff --git a/net/base/net_error_list.h b/net/base/net_error_list.h
+index 296024b..4402087 100644
+--- a/net/base/net_error_list.h
++++ b/net/base/net_error_list.h
+@@ -794,6 +794,9 @@ NET_ERROR(CERT_DATABASE_CHANGED, -714)
+ // Failure to import Channel ID.
+ NET_ERROR(CHANNEL_ID_IMPORT_FAILED, -715)
+ 
++// Failure to sign using Channel ID.
++NET_ERROR(CHANNEL_ID_SIGN_FAILED, -716)
++
+ // DNS error codes.
+ 
+ // DNS resolver received a malformed response.
+diff --git a/net/log/net_log_event_type_list.h b/net/log/net_log_event_type_list.h
+index 7b7350b..dcc6ad2 100644
+--- a/net/log/net_log_event_type_list.h
++++ b/net/log/net_log_event_type_list.h
+@@ -484,6 +484,12 @@ EVENT_TYPE(SSL_CHANNEL_ID_REQUESTED)
+ // A channel ID was provided to the SSL library to be sent to the SSL server.
+ EVENT_TYPE(SSL_CHANNEL_ID_PROVIDED)
+ 
++// The SSL server requested that something be signed with a channel ID key.
++EVENT_TYPE(SSL_CHANNEL_ID_SIGN_REQUESTED)
++
++// A channel ID was used to sign something requested by the SSL library.
++EVENT_TYPE(SSL_CHANNEL_ID_SIGN_PROVIDED)
++
+ // A client certificate (or none) was provided to the SSL library to be sent
+ // to the SSL server.
+ // The following parameters are attached to the event:
+diff --git a/net/net.gypi b/net/net.gypi
+index eddea8a..cb9384c 100644
+--- a/net/net.gypi
++++ b/net/net.gypi
+@@ -181,6 +181,10 @@
+       'ssl/channel_id_service.h',
+       'ssl/channel_id_store.cc',
+       'ssl/channel_id_store.h',
++      'ssl/channel_id_key_manager_u.c',
++      'ssl/channel_id_key_manager_u.h',
++      'ssl/sgx_util.cc',
++      'ssl/sgx_util.h',
+       'ssl/client_key_store.cc',
+       'ssl/client_key_store.h',
+       'ssl/default_channel_id_store.cc',
+diff --git a/net/socket/ssl_client_socket_openssl.cc b/net/socket/ssl_client_socket_openssl.cc
+index 9941436..97cf93f 100644
+--- a/net/socket/ssl_client_socket_openssl.cc
++++ b/net/socket/ssl_client_socket_openssl.cc
+@@ -8,6 +8,7 @@
+ #include "net/socket/ssl_client_socket_openssl.h"
+ 
+ #include <errno.h>
++#include <iostream>
+ #include <openssl/bio.h>
+ #include <openssl/bytestring.h>
+ #include <openssl/err.h>
+@@ -1133,6 +1134,12 @@ int SSLClientSocketOpenSSL::DoHandshake() {
+       GotoState(STATE_CHANNEL_ID_LOOKUP);
+       return OK;
+     }
++    if (ssl_error == SSL_ERROR_WANT_CHANNEL_ID_SIGNATURE) {
++      // The server supports channel ID. Stop to sign before returning to
++      // the handshake.
++      GotoState(STATE_CHANNEL_ID_SIGN);
++      return OK;
++    }
+     if (ssl_error == SSL_ERROR_WANT_X509_LOOKUP &&
+         !ssl_config_.send_client_cert) {
+       return ERR_SSL_CLIENT_AUTH_CERT_NEEDED;
+@@ -1285,6 +1292,89 @@ int SSLClientSocketOpenSSL::DoChannelIDLookupComplete(int result) {
+   return OK;
+ }
+ 
++int SSLClientSocketOpenSSL::DoChannelIDGetOrCreateAndSign() {
++  net_log_.AddEvent(NetLog::TYPE_SSL_CHANNEL_ID_SIGN_REQUESTED);
++  GotoState(STATE_CHANNEL_ID_SIGN_COMPLETE);
++
++  return channel_id_service_->GetOrCreateChannelID(
++      host_and_port_.host(), &channel_id_key_,
++      base::Bind(&SSLClientSocketOpenSSL::OnHandshakeIOComplete,
++                 base::Unretained(this)),
++      &channel_id_request_);
++}
++
++int SSLClientSocketOpenSSL::DoChannelIDGetOrCreateAndSignComplete(int result) {
++  if (result < 0)
++    return result;
++
++  // Written by the |channel_id_service_|.
++  ECDSA_SIG *channel_id_signature = NULL;
++  // Written by the |channel_id_service_|.
++  EVP_PKEY *channel_id_public_key = NULL;
++
++  // get digest from openssl
++  size_t digest_len = ssl_->tlsext_channel_id_digest_len;
++  uint8_t *digest = (uint8_t *)calloc(digest_len, sizeof(uint8_t));
++  if (!digest) {
++    return -1;
++  }
++  crypto::OpenSSLErrStackTracer err_tracer(FROM_HERE);
++  int rv = SSL_get_tls_channel_id_digest(ssl_, digest);
++  if (!rv) {
++    LOG(ERROR) << "Failed to get Channel ID digest to sign.";
++    int err = SSL_get_error(ssl_, rv);
++    free(digest);
++    return MapOpenSSLError(err, err_tracer);
++  }
++
++  // sign
++  rv = channel_id_service_->SignDigest(digest, digest_len, &channel_id_signature,
++                                  &channel_id_public_key,
++                                  std::move(channel_id_key_));
++  if (rv != OK || !channel_id_signature || !channel_id_public_key) {
++    LOG(ERROR) << "Failed to sign Channel ID digest.";
++    free(digest);
++    EVP_PKEY_free(channel_id_public_key);
++    ECDSA_SIG_free(channel_id_signature);
++    return ERR_CHANNEL_ID_SIGN_FAILED;
++  }
++
++  // Hand the signature to OpenSSL.
++  // Check for error in case OpenSSL rejects the digest.
++  rv = SSL_set1_tls_channel_id_signature(ssl_, channel_id_signature);
++  if (!rv) {
++    LOG(ERROR) << "Failed to set Channel ID signature.";
++    int err = SSL_get_error(ssl_, rv);
++    free(digest);
++    EVP_PKEY_free(channel_id_public_key);
++    ECDSA_SIG_free(channel_id_signature);
++    return MapOpenSSLError(err, err_tracer);
++  }
++
++  rv = SSL_set1_tls_channel_id_public_key(ssl_, channel_id_public_key);
++  if (!rv) {
++    LOG(ERROR) << "Failed to set Channel ID public key.";
++    int err = SSL_get_error(ssl_, rv);
++    free(digest);
++    EVP_PKEY_free(channel_id_public_key);
++    ECDSA_SIG_free(channel_id_signature);
++    return MapOpenSSLError(err, err_tracer);
++  }
++
++  // free the ECDSA_SIG
++  ECDSA_SIG_free(channel_id_signature);
++  // free the public key
++  EVP_PKEY_free(channel_id_public_key);
++  // free the digest
++  free(digest);
++
++  // Return to the handshake.
++  channel_id_sent_ = true;
++  net_log_.AddEvent(NetLog::TYPE_SSL_CHANNEL_ID_SIGN_PROVIDED);
++  GotoState(STATE_HANDSHAKE);
++  return OK;
++}
++
+ int SSLClientSocketOpenSSL::DoVerifyCert(int result) {
+   DCHECK(!server_cert_chain_->empty());
+   DCHECK(start_cert_verification_time_.is_null());
+@@ -1505,6 +1595,13 @@ int SSLClientSocketOpenSSL::DoHandshakeLoop(int last_io_result) {
+       case STATE_CHANNEL_ID_LOOKUP_COMPLETE:
+         rv = DoChannelIDLookupComplete(rv);
+         break;
++      case STATE_CHANNEL_ID_SIGN:
++        DCHECK_EQ(OK, rv);
++        rv = DoChannelIDGetOrCreateAndSign();
++       break;
++      case STATE_CHANNEL_ID_SIGN_COMPLETE:
++        rv = DoChannelIDGetOrCreateAndSignComplete(rv);
++        break;
+       case STATE_VERIFY_CERT:
+         DCHECK_EQ(OK, rv);
+         rv = DoVerifyCert(rv);
+diff --git a/net/socket/ssl_client_socket_openssl.h b/net/socket/ssl_client_socket_openssl.h
+index 6dabb6a..9ef6840 100644
+--- a/net/socket/ssl_client_socket_openssl.h
++++ b/net/socket/ssl_client_socket_openssl.h
+@@ -125,6 +125,8 @@ class SSLClientSocketOpenSSL : public SSLClientSocket {
+   int DoHandshakeComplete(int result);
+   int DoChannelIDLookup();
+   int DoChannelIDLookupComplete(int result);
++  int DoChannelIDGetOrCreateAndSign();
++  int DoChannelIDGetOrCreateAndSignComplete(int result);
+   int DoVerifyCert(int result);
+   int DoVerifyCertComplete(int result);
+   void DoConnectCallback(int result);
+@@ -320,6 +322,8 @@ class SSLClientSocketOpenSSL : public SSLClientSocket {
+     STATE_HANDSHAKE_COMPLETE,
+     STATE_CHANNEL_ID_LOOKUP,
+     STATE_CHANNEL_ID_LOOKUP_COMPLETE,
++    STATE_CHANNEL_ID_SIGN,
++    STATE_CHANNEL_ID_SIGN_COMPLETE,
+     STATE_VERIFY_CERT,
+     STATE_VERIFY_CERT_COMPLETE,
+   };
+diff --git a/net/ssl/Makefile b/net/ssl/Makefile
+new file mode 100644
+index 0000000..ef84b12
+--- /dev/null
++++ b/net/ssl/Makefile
+@@ -0,0 +1,92 @@
++# Copyright 2013 The Chromium Authors. All rights reserved.
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++####### SGX SDK Settings ########
++
++SGX_SDK ?= /opt/intel/sgxsdk
++SGX_MODE ?= HW
++SGX_ARCH ?= x64
++SGX_PRERELEASE ?= 1
++SGX_DEBUG ?= 0
++
++ifeq ($(shell getconf LONG_BIT), 32)
++	SGX_ARCH := x86
++else ifeq ($(findstring -m32, $(CXXFLAGS)), -m32)
++	SGX_ARCH := x86
++endif
++
++ifeq ($(SGX_ARCH), x86)
++	SGX_COMMON_CFLAGS := -m32
++	SGX_LIBRARY_PATH := $(SGX_SDK)/lib
++	SGX_ENCLAVE_SIGNER := $(SGX_SDK)/bin/x86/sgx_sign
++	SGX_EDGER8R := $(SGX_SDK)/bin/x86/sgx_edger8r
++else
++	SGX_COMMON_CFLAGS := -m64
++	SGX_LIBRARY_PATH := $(SGX_SDK)/lib64
++	SGX_ENCLAVE_SIGNER := $(SGX_SDK)/bin/x64/sgx_sign
++	SGX_EDGER8R := $(SGX_SDK)/bin/x64/sgx_edger8r
++endif
++
++
++######## Enclave Settings ########
++
++ifneq ($(SGX_MODE), HW)
++	Trts_Library_Name := sgx_trts_sim
++	Service_Library_Name := sgx_tservice_sim
++else
++	Trts_Library_Name := sgx_trts
++	Service_Library_Name := sgx_tservice
++endif
++
++Enclave_C_Files := channel_id_enclave/channel_id_key_manager.c
++Enclave_Include_Paths := -Ichannel_id_enclave -I$(SGX_SDK)/include -I$(SGX_SDK)/include/tlibc -I$(SGX_SDK)/include/stlport
++
++Enclave_Compile_Flags := -O3 -fPIC -nostdinc -fvisibility=hidden -fpie -fstack-protector $(Enclave_Include_Paths)
++Enclave_Link_Flags := $(SGX_COMMON_CFLAGS) -Wl,--no-undefined -nostdlib -nodefaultlibs -nostartfiles -L$(SGX_LIBRARY_PATH) \
++	-Wl,--whole-archive -l$(Trts_Library_Name) -Wl,--no-whole-archive \
++	-Wl,--start-group -lsgx_tstdc -lsgx_tstdcxx -lsgx_tcrypto -l$(Service_Library_Name) -Wl,--end-group \
++	-Wl,-Bstatic -Wl,-Bsymbolic -Wl,--no-undefined \
++    -Wl,-pie,-eenclave_entry -Wl,--export-dynamic  \
++    -Wl,--defsym,__ImageBase=0 \
++	-Wl,--version-script=channel_id_enclave/channel_id_key_manager.lds
++
++Enclave_C_Objects := $(Enclave_C_Files:.c=.o)
++
++all: channel_id_key_manager_u.c channel_id_key_manager.signed.so
++	@echo "Untrusted Channel ID key manager stub created."
++	@echo "Channel ID key manager enclave created."
++
++enclave: channel_id_key_manager.signed.so
++	@echo "Channel ID key manager enclave created."
++
++######## Enclave Objects ########
++
++channel_id_key_manager_u.c: $(SGX_EDGER8R) channel_id_enclave/channel_id_key_manager.edl
++	@$(SGX_EDGER8R) --untrusted channel_id_enclave/channel_id_key_manager.edl --search-path channel_id_enclave --search-path $(SGX_SDK)/include
++	@echo "GEN  =>  $@"
++
++channel_id_enclave/channel_id_key_manager_t.c: $(SGX_EDGER8R) channel_id_enclave/channel_id_key_manager.edl
++	@cd channel_id_enclave && $(SGX_EDGER8R) --trusted ../channel_id_enclave/channel_id_key_manager.edl --search-path ../channel_id_enclave --search-path $(SGX_SDK)/include
++	@echo "GEN  =>  $@"
++
++channel_id_enclave/channel_id_key_manager_t.o: channel_id_enclave/channel_id_key_manager_t.c
++	@$(CC) $(SGX_COMMON_CFLAGS) $(Enclave_Compile_Flags) -c $< -o $@
++	@echo "CC   <=  $<"
++
++channel_id_enclave/%.o: channel_id_enclave/%.c
++	@$(CC) $(SGX_COMMON_CFLAGS) $(Enclave_Compile_Flags) -c $< -o $@
++	@echo "CC  <=  $<"
++
++channel_id_enclave/channel_id_key_manager.so: channel_id_enclave/channel_id_key_manager_t.o $(Enclave_C_Objects)
++	@$(CC) $(SGX_COMMON_CFLAGS) $^ -shared -o $@ $(Enclave_Link_Flags)
++	@echo "LINK =>  $@"
++
++channel_id_key_manager.signed.so: channel_id_enclave/channel_id_key_manager.so
++	@LD_LIBRARY_PATH=$(SGX_LIBRARY_PATH) $(SGX_ENCLAVE_SIGNER) sign -key channel_id_enclave/channel_id_key_manager_private.pem -enclave $< -out $@ -config channel_id_enclave/channel_id_key_manager.config.xml
++	@echo "SIGN =>  $@"
++
++.PHONY: clean
++
++clean:
++	@rm -f $(Enclave_C_Objects) channel_id_enclave/*.so channel_id_enclave/channel_id_key_manager_t.* channel_id_key_manager_u.* *.log
+diff --git a/net/ssl/channel_id_enclave/channel_id_key_manager.c b/net/ssl/channel_id_enclave/channel_id_key_manager.c
+new file mode 100644
+index 0000000..415fe6c
+--- /dev/null
++++ b/net/ssl/channel_id_enclave/channel_id_key_manager.c
+@@ -0,0 +1,101 @@
++// Copyright 2013 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <sgx_tcrypto.h>
++// SGX SDK API for sealing and unsealing functionalities
++// Requirements: libsgx_tservice.a (HW) or libsgx_tservice_sim.a (simulation mode)
++#include <sgx_tseal.h>
++// SGX SDK Internals
++// Requirements: libsgx_trts.a (HW) or libsgx_trts_sim.a (simulation mode)
++#include <sgx_trts.h>
++
++// Prototype declarations for trusted proxies and bridges
++#include "channel_id_key_manager_t.h"
++
++sgx_ecc_state_handle_t ecc_handle;
++
++// Enclave Functions
++// Applications can call these functions by making Enclave Calls (ECALLS) using the untrusted proxy function generated by the sgx_edger8r tool
++
++uint32_t GenerateSealedECKey(
++    uint8_t *sealed_key,
++    int sealed_key_size,
++    uint8_t *public_key_out,
++    int public_key_size) {
++  sgx_status_t ret = sgx_ecc256_open_context(&ecc_handle);
++  if (ret != SGX_SUCCESS) {
++    return 1;
++  }
++
++  sgx_ec256_private_t private_key;
++  sgx_ec256_public_t *public_key = (sgx_ec256_public_t *) public_key_out;
++
++  // public key output directly
++  ret = sgx_ecc256_create_key_pair(&private_key, public_key, ecc_handle);
++  if (ret != SGX_SUCCESS) {
++    return 2;
++  }
++
++  ret = sgx_ecc256_close_context(ecc_handle);
++
++  // seal key and output sealed key
++  uint32_t result = 0;
++  sgx_sealed_data_t *sealed_key_data = (sgx_sealed_data_t *) sealed_key;
++
++  result = sgx_seal_data(0, NULL, sizeof(private_key), (uint8_t *)&private_key,
++                         sealed_key_size, sealed_key_data);
++
++  return result;
++}
++
++// returns 2 on invalid parameter to unseal
++// returns 1 on failure to open context
++// returns 4 if signature size is too small
++// returns 3 on failure to sign
++// returns 0 on success
++uint32_t SignUsingSealedKey(uint8_t *message, int message_size,
++			    uint8_t *signature_out, int signature_size,
++			    uint8_t *sealed_key_in, int sealed_key_size) {
++  // unseal key
++  sgx_ec256_private_t private_key;
++
++  int32_t result = 0;
++  sgx_sealed_data_t *sealed_key = (sgx_sealed_data_t *) sealed_key_in;
++  // PrintString("Inside Enclave: Unsealing Password.\n");
++  int clear_private_key_size = sizeof(sgx_ec256_private_t);
++  result = sgx_unseal_data(sealed_key,
++                           NULL, // optional, but check how to mark it optional
++                           NULL,
++                           (uint8_t *) &private_key,
++                           &clear_private_key_size);
++  if (result != 0) {
++    return result;
++  }
++
++  // sign
++  sgx_ec256_signature_t *signature = (sgx_ec256_signature_t *)signature_out;
++
++  if (signature_size < sizeof(sgx_ec256_signature_t)) {
++    return 4;
++  }
++
++  sgx_status_t ret = sgx_ecc256_open_context(&ecc_handle);
++  if (ret != SGX_SUCCESS) {
++    return 1;
++  }
++
++  ret = sgx_ecdsa_sign(message, message_size, &private_key, signature,
++                       ecc_handle);
++  if (ret != SGX_SUCCESS) {
++    return 3;
++  }
++
++  ret = sgx_ecc256_close_context(ecc_handle);
++  return 0;
++}
++
++uint32_t CalculateSealedKeySize(uint32_t *size) {
++  *size = sgx_calc_sealed_data_size(0, sizeof(sgx_ec256_private_t));
++  return 0;
++}
+diff --git a/net/ssl/channel_id_enclave/channel_id_key_manager.config.xml b/net/ssl/channel_id_enclave/channel_id_key_manager.config.xml
+new file mode 100644
+index 0000000..5e75a02
+--- /dev/null
++++ b/net/ssl/channel_id_enclave/channel_id_key_manager.config.xml
+@@ -0,0 +1,11 @@
++<!-- Copyright 2013 The Chromium Authors. All rights reserved. -->
++<!-- Use of this source code is governed by a BSD-style license that can be -->
++<!-- found in the LICENSE file. -->
++<EnclaveConfiguration>
++  <ProdID>0</ProdID>
++  <ISVSVN>0</ISVSVN>
++  <StackMaxSize>0x40000</StackMaxSize>
++  <HeapMaxSize>0x100000</HeapMaxSize>
++  <TCSNum>10</TCSNum>
++  <TCSPolicy>0</TCSPolicy>
++</EnclaveConfiguration>
+diff --git a/net/ssl/channel_id_enclave/channel_id_key_manager.edl b/net/ssl/channel_id_enclave/channel_id_key_manager.edl
+new file mode 100644
+index 0000000..2d5cab7
+--- /dev/null
++++ b/net/ssl/channel_id_enclave/channel_id_key_manager.edl
+@@ -0,0 +1,22 @@
++// Copyright 2013 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++enclave {
++    trusted {
++        public uint32_t GenerateSealedECKey(
++            [out, size=sealed_key_size] uint8_t *sealed_key,
++            int sealed_key_size,
++            [out, size=public_key_size] uint8_t *public_key,
++            int public_key_size);
++        public uint32_t SignUsingSealedKey(
++            [in, size=message_size] uint8_t *message,
++            int message_size,
++            [out, size=signature_size] uint8_t *signature,
++            int signature_size,
++            [in, size=sealed_key_size] uint8_t *sealed_key,
++            int sealed_key_size);
++        public uint32_t CalculateSealedKeySize(
++            [out, size=4] uint32_t *size);
++    };
++};
+diff --git a/net/ssl/channel_id_enclave/channel_id_key_manager.lds b/net/ssl/channel_id_enclave/channel_id_key_manager.lds
+new file mode 100644
+index 0000000..900d8d1
+--- /dev/null
++++ b/net/ssl/channel_id_enclave/channel_id_key_manager.lds
+@@ -0,0 +1,13 @@
++// Copyright 2013 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++channel_id_key_manager.so
++{
++    global:
++        g_global_data_sim;
++	g_global_data;
++        enclave_entry;
++    local:
++        *;
++};
+diff --git a/net/ssl/channel_id_enclave/channel_id_key_manager_private.pem b/net/ssl/channel_id_enclave/channel_id_key_manager_private.pem
+new file mode 100644
+index 0000000..529d07b
+--- /dev/null
++++ b/net/ssl/channel_id_enclave/channel_id_key_manager_private.pem
+@@ -0,0 +1,39 @@
++-----BEGIN RSA PRIVATE KEY-----
++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
++-----END RSA PRIVATE KEY-----
+diff --git a/net/ssl/channel_id_service.cc b/net/ssl/channel_id_service.cc
+index e17b813..6d66695 100644
+--- a/net/ssl/channel_id_service.cc
++++ b/net/ssl/channel_id_service.cc
+@@ -5,9 +5,15 @@
+ #include "net/ssl/channel_id_service.h"
+ 
+ #include <algorithm>
++#include <iostream>
+ #include <limits>
+ #include <utility>
+ 
++#include <openssl/bn.h>
++#include <openssl/ecdsa.h>
++#include <openssl/evp.h>
++#include <openssl/obj_mac.h>
++
+ #include "base/bind.h"
+ #include "base/bind_helpers.h"
+ #include "base/callback_helpers.h"
+@@ -34,6 +40,34 @@
+ #include <private/pprthred.h>  // PR_DetachThread
+ #endif
+ 
++#define SGX_ENABLE
++
++// Define SGX_ENABLE for sealing private keys in SGX
++
++#define CIDSDEBUG(x) { \
++        std::cout << __func__ << ": " << x << "\n"; \
++}
++
++#ifdef SGX_ENABLE
++// Prototype Declarations for untrusted proxies and bridges. This is
++// generated by the edger8r tool and along with the trusted counterpart
++// provide an interface between the untrusted application and the enclave
++#include "net/ssl/channel_id_key_manager_u.h"
++
++// Provides API for Creating and Destroying Enclaves to the Application
++// Requirements: libsgx_urts.so (HW Mode) or libsgx_urts_sim.so (Simulation Mode)
++#include <sgx_urts.h>
++
++// Provides Utilities for sealing and unsealing: Confidentiality and integrity
++// protection of data outside an enclave
++// Requirements: libsgx_tservice.a (HW Mode) or libsgx_tservice_sim.a (Simulation Mode)
++#include <sgx_tseal.h>
++
++#include <sgx_tcrypto.h>
++
++#include "net/ssl/sgx_util.h"
++#endif
++
+ namespace net {
+ 
+ namespace {
+@@ -85,14 +119,80 @@ void RecordGetChannelIDTime(base::TimeDelta request_time) {
+ // unjoined thread, due to relying on a non-leaked LazyInstance
+ scoped_ptr<ChannelIDStore::ChannelID> GenerateChannelID(
+     const std::string& server_identifier,
++#ifdef SGX_ENABLE
++    std::shared_ptr<SGXEnclaveID> sgx_enclave_id,
++#endif
+     int* error) {
+   scoped_ptr<ChannelIDStore::ChannelID> result;
+ 
+   base::TimeTicks start = base::TimeTicks::Now();
+   base::Time creation_time = base::Time::Now();
++
++  // If SGX fails, we fall back to non-SGX behavior.
++
++
++#ifdef SGX_ENABLE
++  uint32_t retval = 0;
++  uint32_t sealed_key_size = 0;
++  if (!sgx_enclave_id || sgx_enclave_id->eid() == 0) {
++    CIDSDEBUG("No eid available.");
++    *error = ERR_KEY_GENERATION_FAILED;
++    return result;
++  }
++  retval = CalculateSealedKeySize(sgx_enclave_id->eid(), &retval, &sealed_key_size);
++  if (sealed_key_size == 0) {
++    CIDSDEBUG("Sealed key size is zero with eid " << sgx_enclave_id->eid());
++    *error = ERR_KEY_GENERATION_FAILED;
++    return result;
++  }
++  uint8_t *sealed_key = (uint8_t *)calloc(sealed_key_size, sizeof(uint8_t));
++  if (!sealed_key) {
++    CIDSDEBUG("Out of memory.");
++    *error = ERR_KEY_GENERATION_FAILED;
++    return result;
++  }
++  sgx_ec256_public_t sgx_public_key;
++  uint32_t public_key_size = sizeof(sgx_ec256_public_t);
++  sgx_status_t status = GenerateSealedECKey(sgx_enclave_id->eid(), &retval,
++      sealed_key, sealed_key_size, (uint8_t *)&sgx_public_key, public_key_size);
++  if (status != SGX_SUCCESS) {
++    CIDSDEBUG("Key generation failed with return value " << retval << ".");
++    *error = ERR_KEY_GENERATION_FAILED;
++    free(sealed_key);
++    return result;
++  }
++
++  // Using the same curve as in ECPrivateKey::Create.
++  EC_KEY *public_key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
++  if (!public_key) {
++    CIDSDEBUG("Trouble creating EC KEY.");
++    *error = ERR_KEY_GENERATION_FAILED;
++    return result;
++  }
++  // get bignum x and y from SGX
++  BIGNUM *x = LittleEndianArrayToBIGNUMuint8_t(sgx_public_key.gx,
++      SGX_ECP256_KEY_SIZE);
++  BIGNUM *y = LittleEndianArrayToBIGNUMuint8_t(sgx_public_key.gy,
++      SGX_ECP256_KEY_SIZE);
++  retval = EC_KEY_set_public_key_affine_coordinates(public_key, x, y);
++  if (!retval) {
++    CIDSDEBUG("Could not set public key coordinates.");
++    *error = ERR_KEY_GENERATION_FAILED;
++    return result;
++  }
++  BN_free(x);
++  BN_free(y);
++  scoped_ptr<crypto::ECPrivateKey> key(
++      crypto::ECPrivateKey::CreateFromKeyBlobAndPublicKey(sealed_key,
++          sealed_key_size, public_key));
++  free(sealed_key);
++  EC_KEY_free(public_key);
++#else
+   scoped_ptr<crypto::ECPrivateKey> key(crypto::ECPrivateKey::Create());
++#endif
+ 
+   if (!key) {
++    CIDSDEBUG("No key made.");
+     DLOG(ERROR) << "Unable to create channel ID key pair";
+     *error = ERR_KEY_GENERATION_FAILED;
+     return result;
+@@ -122,9 +222,16 @@ class ChannelIDServiceWorker {
+       scoped_ptr<ChannelIDStore::ChannelID>)> WorkerDoneCallback;
+ 
+   ChannelIDServiceWorker(const std::string& server_identifier,
+-                         const WorkerDoneCallback& callback)
++#ifdef SGX_ENABLE
++                         std::shared_ptr<SGXEnclaveID> sgx_enclave_id,
++#endif
++                         const WorkerDoneCallback& callback
++                         )
+       : server_identifier_(server_identifier),
+         origin_task_runner_(base::ThreadTaskRunnerHandle::Get()),
++#ifdef SGX_ENABLE
++        sgx_enclave_id_(sgx_enclave_id),
++#endif
+         callback_(callback) {}
+ 
+   // Starts the worker on |task_runner|. If the worker fails to start, such as
+@@ -143,7 +250,11 @@ class ChannelIDServiceWorker {
+     // Runs on a worker thread.
+     int error = ERR_FAILED;
+     scoped_ptr<ChannelIDStore::ChannelID> channel_id =
+-        GenerateChannelID(server_identifier_, &error);
++        GenerateChannelID(server_identifier_,
++#ifdef SGX_ENABLE
++            sgx_enclave_id_,
++#endif
++            &error);
+ #if !defined(USE_OPENSSL)
+     // Detach the thread from NSPR.
+     // Calling NSS functions attaches the thread to NSPR, which stores
+@@ -161,6 +272,9 @@ class ChannelIDServiceWorker {
+ 
+   const std::string server_identifier_;
+   scoped_refptr<base::SequencedTaskRunner> origin_task_runner_;
++#ifdef SGX_ENABLE
++  std::shared_ptr<SGXEnclaveID> sgx_enclave_id_;
++#endif
+   WorkerDoneCallback callback_;
+ 
+   DISALLOW_COPY_AND_ASSIGN(ChannelIDServiceWorker);
+@@ -203,6 +317,7 @@ class ChannelIDServiceJob {
+     for (std::vector<ChannelIDService::Request*>::iterator i = requests.begin();
+          i != requests.end(); i++) {
+       scoped_ptr<crypto::ECPrivateKey> key_copy;
++
+       if (key)
+         key_copy.reset(key->Copy());
+       (*i)->Post(error, std::move(key_copy));
+@@ -292,6 +407,9 @@ ChannelIDService::ChannelIDService(
+       key_store_hits_(0),
+       inflight_joins_(0),
+       workers_created_(0),
++#ifdef SGX_ENABLE
++      sgx_enclave_id_(std::make_shared<SGXEnclaveID>()),
++#endif
+       weak_ptr_factory_(this) {
+ }
+ 
+@@ -309,6 +427,59 @@ std::string ChannelIDService::GetDomainForHost(const std::string& host) {
+   return domain;
+ }
+ 
++int ChannelIDService::SignDigest(uint8_t *digest,
++                                  size_t digest_len,
++                                  ECDSA_SIG **signature,
++                                  EVP_PKEY **public_key,
++                                  scoped_ptr<crypto::ECPrivateKey> key) {
++#ifdef SGX_ENABLE
++  base::TimeTicks start = base::TimeTicks::Now();
++  // Sign using the retrieved key, in channel_id_key_.
++  // It will be an ECPrivateKey, created with SGX.
++  // Retrieve the opaque blob, and pass it to the enclave.
++  int signature_size = sizeof(sgx_ec256_signature_t);
++  sgx_ec256_signature_t ui_signature;
++
++  uint8_t *sealed_key = key->key_blob();
++  if (!sealed_key) {
++    CIDSDEBUG("No sealed key available.");
++    return -1;
++  }
++  uint32_t sealed_key_size = key->key_blob_size();
++
++  uint32_t retval = 0;
++  if (!sgx_enclave_id_ || sgx_enclave_id_->eid() == 0) {
++    return -1;
++  }
++  SignUsingSealedKey(sgx_enclave_id_->eid(), &retval, digest, digest_len,
++		     (uint8_t *)&ui_signature, signature_size,
++		     sealed_key, sealed_key_size);
++
++
++  // put a copy of the public key in |public_key|
++  *public_key = EVP_PKEY_up_ref(key->public_key());
++  if (!key->public_key()) {
++    return -1;
++  }
++
++  // enclave should put the signature into |signature|
++  ECDSA_SIG *sig = ECDSA_SIG_new();
++  sig->r = LittleEndianArrayToBIGNUMuint8_t((uint8_t *)ui_signature.x,
++                                  SGX_NISTP_ECP256_KEY_SIZE * sizeof(uint32_t));
++  sig->s = LittleEndianArrayToBIGNUMuint8_t((uint8_t *)ui_signature.y,
++                                  SGX_NISTP_ECP256_KEY_SIZE * sizeof(uint32_t));
++
++  *signature = sig;
++  UMA_HISTOGRAM_CUSTOM_TIMES("DomainBoundCerts.SignDigestTime",
++                             base::TimeTicks::Now() - start,
++                             base::TimeDelta::FromMilliseconds(1),
++                             base::TimeDelta::FromMinutes(5),
++                             50);
++  return OK;
++#endif
++  return -1;
++}
++
+ int ChannelIDService::GetOrCreateChannelID(
+     const std::string& host,
+     scoped_ptr<crypto::ECPrivateKey>* key,
+@@ -345,6 +516,9 @@ int ChannelIDService::GetOrCreateChannelID(
+     workers_created_++;
+     ChannelIDServiceWorker* worker = new ChannelIDServiceWorker(
+         domain,
++#ifdef SGX_ENABLE
++        sgx_enclave_id_,
++#endif
+         base::Bind(&ChannelIDService::GeneratedChannelID,
+                    weak_ptr_factory_.GetWeakPtr()));
+     if (!worker->Start(task_runner_)) {
+@@ -429,6 +603,9 @@ void ChannelIDService::GotChannelID(int err,
+   workers_created_++;
+   ChannelIDServiceWorker* worker = new ChannelIDServiceWorker(
+       server_identifier,
++#ifdef SGX_ENABLE
++      sgx_enclave_id_,
++#endif
+       base::Bind(&ChannelIDService::GeneratedChannelID,
+                  weak_ptr_factory_.GetWeakPtr()));
+   if (!worker->Start(task_runner_)) {
+diff --git a/net/ssl/channel_id_service.h b/net/ssl/channel_id_service.h
+index eb4a92a..7a87611 100644
+--- a/net/ssl/channel_id_service.h
++++ b/net/ssl/channel_id_service.h
+@@ -11,7 +11,8 @@
+ #include <string>
+ #include <vector>
+ 
+-#include "base/macros.h"
++#include <openssl/ecdsa.h>
++
+ #include "base/memory/scoped_ptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/threading/non_thread_safe.h"
+@@ -20,6 +21,12 @@
+ #include "net/base/net_export.h"
+ #include "net/ssl/channel_id_store.h"
+ 
++#define SGX_ENABLE
++
++#ifdef SGX_ENABLE
++#include "net/ssl/sgx_util.h"
++#endif
++
+ namespace base {
+ class TaskRunner;
+ }  // namespace base
+@@ -106,6 +113,20 @@ class NET_EXPORT ChannelIDService
+                            const CompletionCallback& callback,
+                            Request* out_req);
+ 
++  // Signs the digests given in |digest| using |key|.
++  // Puts the result into |signature|. Also puts the public key into
++  // |public_key| (this could be done in the caller, here for convenience).
++  //
++  // Returns OK if successful or an error code upon failure.
++  //
++  // On successful completion, |signature| holds the ECDSA signature.
++  // Caller is responsible for calling |ECDSA_SIG_free|.
++  int SignDigest(uint8_t *digest,
++                 size_t digest_len,
++                 ECDSA_SIG **signature,
++                 EVP_PKEY **public_key,
++                 scoped_ptr<crypto::ECPrivateKey> key);
++
+   // Fetches the channel ID for the specified host if one exists.
+   // Returns OK if successful, ERR_FILE_NOT_FOUND if none exists, or an error
+   // code upon failure.
+@@ -181,6 +202,10 @@ class NET_EXPORT ChannelIDService
+   uint64_t inflight_joins_;
+   uint64_t workers_created_;
+ 
++#ifdef SGX_ENABLE
++  std::shared_ptr<SGXEnclaveID> sgx_enclave_id_;
++#endif
++
+   base::WeakPtrFactory<ChannelIDService> weak_ptr_factory_;
+ 
+   DISALLOW_COPY_AND_ASSIGN(ChannelIDService);
+diff --git a/net/ssl/channel_id_service_unittest.cc b/net/ssl/channel_id_service_unittest.cc
+index 1e98b61..48fb791 100644
+--- a/net/ssl/channel_id_service_unittest.cc
++++ b/net/ssl/channel_id_service_unittest.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "net/ssl/channel_id_service.h"
+ 
++#include <openssl/evp.h>
+ #include <string>
+ #include <vector>
+ 
+@@ -150,6 +151,41 @@ TEST_F(ChannelIDServiceTest, GetCacheMiss) {
+   EXPECT_FALSE(key);
+ }
+ 
++TEST_F(ChannelIDServiceTest, SignDigest) {
++  std::string host("encrypted.google.com");
++
++  int error;
++  TestCompletionCallback callback;
++  ChannelIDService::Request request;
++
++  // Generate key.
++  scoped_ptr<crypto::ECPrivateKey> key1;
++  EXPECT_EQ(0, service_->channel_id_count());
++  error = service_->GetOrCreateChannelID(host, &key1, callback.callback(),
++                                         &request);
++  EXPECT_EQ(ERR_IO_PENDING, error);
++  EXPECT_TRUE(request.is_active());
++  error = callback.WaitForResult();
++  EXPECT_EQ(OK, error);
++  EXPECT_EQ(1, service_->channel_id_count());
++  EXPECT_TRUE(key1);
++  EXPECT_FALSE(request.is_active());
++
++  // Sign digest.
++  char str[] = "Test string.";
++  uint8_t* digest = (uint8_t *)str;
++  size_t digest_len = 13;
++  ECDSA_SIG *signature;
++  EVP_PKEY *public_key;
++  error = service_->SignDigest(digest, digest_len, &signature,
++                               &public_key, std::move(key1));
++  EXPECT_EQ(OK, error);
++  EXPECT_TRUE(public_key);
++  EXPECT_TRUE(signature);
++  ECDSA_SIG_free(signature);
++  EVP_PKEY_free(public_key);
++}
++
+ TEST_F(ChannelIDServiceTest, CacheHit) {
+   std::string host("encrypted.google.com");
+ 
+diff --git a/net/ssl/sgx_util.cc b/net/ssl/sgx_util.cc
+new file mode 100644
+index 0000000..c709dd8
+--- /dev/null
++++ b/net/ssl/sgx_util.cc
+@@ -0,0 +1,83 @@
++// Copyright 2013 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "net/ssl/sgx_util.h"
++
++#include <algorithm>
++#include <cstring>
++#include <iostream>
++
++#include "base/logging.h"
++#include "base/metrics/histogram_macros.h"
++
++// SGX Enclave path
++#define ENCLAVE_PATH "/home/ebp/chromium/src/net/ssl/channel_id_key_manager.signed.so"
++
++sgx_enclave_id_t CreateEnclave();
++void DestroyEnclave(sgx_enclave_id_t eid);
++
++#define CIDSDEBUG(x) { \
++        std::cout << __func__ << ": " << x << "\n"; \
++}
++
++namespace net {
++
++SGXEnclaveID::SGXEnclaveID() : eid_(CreateEnclave()) {}
++
++SGXEnclaveID::~SGXEnclaveID() {
++  DestroyEnclave(eid_);
++}
++
++} //namespace net
++
++// for SGX
++// allocates a BIGNUM
++// Note: this has only been tested on a little endian machine.
++
++BIGNUM *LittleEndianArrayToBIGNUMuint8_t(uint8_t *arr, uint32_t arr_len) {
++  uint8_t arr_copy[arr_len];
++
++  memcpy(arr_copy, arr, arr_len);
++
++  // convert from little endian to big endian
++  std::reverse(arr_copy, arr_copy + arr_len);
++
++  // convert to BIGNUM
++  return BN_bin2bn(arr_copy, arr_len, NULL);
++}
++
++sgx_enclave_id_t CreateEnclave() {
++  // Create SGX enclave on construction
++  int launch_token_update = 0;
++  // Launch token created by enclave licensing service, holds enclave license information
++  sgx_launch_token_t launch_token;
++  memset(&launch_token, 0, sizeof(sgx_launch_token_t));
++  sgx_enclave_id_t eid = 0;
++  // Create Enclave SDK call
++  // Enclave ID, used for referring to the enclave, returned
++
++  CIDSDEBUG("Creating enclave ...");
++  sgx_status_t ret = SGX_ERROR_SERVICE_UNAVAILABLE;
++  base::TimeTicks start = base::TimeTicks::Now();
++  ret = sgx_create_enclave(ENCLAVE_PATH, 1, &launch_token,
++          &launch_token_update, &eid, NULL);
++  if (ret == SGX_SUCCESS) {
++    UMA_HISTOGRAM_CUSTOM_TIMES("DomainBoundCerts.EnclaveCreationTime",
++                             base::TimeTicks::Now() - start,
++                             base::TimeDelta::FromMilliseconds(1),
++                             base::TimeDelta::FromMinutes(5),
++                             50);
++    CIDSDEBUG("Enclave successfully created, eid: " << eid);
++  } else {
++    CIDSDEBUG("Enclave load failed, SGX return: " << ret);
++  }
++  return eid;
++}
++
++void DestroyEnclave(sgx_enclave_id_t eid) {
++  if (eid != 0) {
++    CIDSDEBUG("Destroying enclave, eid: " << eid);
++    sgx_destroy_enclave(eid);
++  }
++}
+diff --git a/net/ssl/sgx_util.h b/net/ssl/sgx_util.h
+new file mode 100644
+index 0000000..f4c458b
+--- /dev/null
++++ b/net/ssl/sgx_util.h
+@@ -0,0 +1,30 @@
++// Copyright 2013 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef NET_SSL_SGX_UTIL_H_
++#define NET_SSL_SGX_UTIL_H_
++
++#include <cstddef>
++#include <mutex>
++
++#include <sgx_urts.h>
++
++#include <openssl/bn.h>
++
++namespace net {
++
++class SGXEnclaveID {
++ public:
++  SGXEnclaveID();
++  ~SGXEnclaveID();
++  sgx_enclave_id_t eid() { return eid_; }
++ private:
++  sgx_enclave_id_t eid_;
++};
++
++} // namespace net
++
++BIGNUM *LittleEndianArrayToBIGNUMuint8_t(uint8_t *arr, uint32_t arr_len);
++
++#endif  // NET_SSL_SGX_UTIL_H_
+diff --git a/tools/metrics/histograms/histograms.xml b/tools/metrics/histograms/histograms.xml
+index 6e1cc97..d7a1799 100644
+--- a/tools/metrics/histograms/histograms.xml
++++ b/tools/metrics/histograms/histograms.xml
+@@ -8310,6 +8310,11 @@ http://cs/file:chrome/histograms.xml - but prefer this file for new entries.
+   <summary>Time spent generating a domain bound cert.</summary>
+ </histogram>
+ 
++<histogram name="DomainBoundCerts.SignDigestTime" units="ms">
++  <owner>ebp@chromium.org</owner>
++  <summary>Time spent signing a TLS digest using a bound token.</summary>
++</histogram>
++
+ <histogram name="DomainBoundCerts.GetCertTime" units="ms">
+   <owner>mattm@chromium.org</owner>
+   <summary>
+@@ -58122,6 +58127,7 @@ http://cs/file:chrome/histograms.xml - but prefer this file for new entries.
+   <int value="-802" label="DNS_SERVER_FAILED"/>
+   <int value="-801" label="DNS_SERVER_REQUIRES_TCP"/>
+   <int value="-800" label="DNS_MALFORMED_RESPONSE"/>
++  <int value="-716" label="CHANNEL_ID_SIGN_FAILED"/>
+   <int value="-715" label="CHANNEL_ID_IMPORT_FAILED"/>
+   <int value="-714" label="CERT_DATABASE_CHANGED"/>
+   <int value="-713" label="SELF_SIGNED_CERT_GENERATION_FAILED"/>
+@@ -71283,6 +71289,7 @@ To add a new entry, add it with any value and run test to compute valid value.
+   <int value="713" label="SELF_SIGNED_CERT_GENERATION_FAILED"/>
+   <int value="714" label="CERT_DATABASE_CHANGED"/>
+   <int value="715" label="CHANNEL_ID_IMPORT_FAILED"/>
++  <int value="716" label="CHANNEL_ID_SIGN_FAILED"/>
+   <int value="800" label="DNS_MALFORMED_RESPONSE"/>
+   <int value="801" label="DNS_SERVER_REQUIRES_TCP"/>
+   <int value="802" label="DNS_SERVER_FAILED"/>
+-- 
+2.8.0.rc3.226.g39d4020
+

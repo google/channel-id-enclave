@@ -1,0 +1,483 @@
+From 9d63fd305f4c220cc8ffd1ac3aa3aa787008ac56 Mon Sep 17 00:00:00 2001
+From: Erica Portnoy <ebp@chromium.org>
+Date: Tue, 29 Mar 2016 12:42:55 -0700
+Subject: [PATCH] Support SGX Channel ID private key PoC, based on
+ afe57cb14d36f70ad4a109fc5e7765d1adc67035
+
+---
+ crypto/ecdsa/ecdsa_asn1.c | 19 +++++++++++++++
+ include/openssl/bio.h     |  4 +++
+ include/openssl/ecdsa.h   |  4 +++
+ include/openssl/ssl.h     | 59 ++++++++++++++++++++++++++++++++++++++++++++
+ ssl/internal.h            |  6 +++++
+ ssl/s3_clnt.c             | 38 +++++++++++++++++++++++++++++
+ ssl/s3_lib.c              | 62 +++++++++++++++++++++++++++++++++++++++++++++++
+ ssl/ssl_lib.c             | 39 +++++++++++++++++++++++++++++
+ ssl/t1_lib.c              | 48 ++++++++++++++++++++++++++++++++++++
+ 9 files changed, 279 insertions(+)
+
+diff --git a/crypto/ecdsa/ecdsa_asn1.c b/crypto/ecdsa/ecdsa_asn1.c
+index 3fee191..404b185 100644
+--- a/crypto/ecdsa/ecdsa_asn1.c
++++ b/crypto/ecdsa/ecdsa_asn1.c
+@@ -108,6 +108,25 @@ void ECDSA_SIG_free(ECDSA_SIG *sig) {
+   OPENSSL_free(sig);
+ }
+ 
++ECDSA_SIG *ECDSA_SIG_copy(ECDSA_SIG *signature) {
++  if (signature == NULL) {
++    return NULL;
++  }
++  ECDSA_SIG *sig = ECDSA_SIG_new();
++  if (sig == NULL) {
++    return NULL;
++  }
++  if (!BN_copy(sig->r, signature->r)) {
++    ECDSA_SIG_free(sig);
++    return NULL;
++  }
++  if (!BN_copy(sig->s, signature->s)) {
++    ECDSA_SIG_free(sig);
++    return NULL;
++  }
++  return sig;
++}
++
+ ECDSA_SIG *ECDSA_SIG_parse(CBS *cbs) {
+   ECDSA_SIG *ret = ECDSA_SIG_new();
+   if (ret == NULL) {
+diff --git a/include/openssl/bio.h b/include/openssl/bio.h
+index c88a3e1..55f1d2c 100644
+--- a/include/openssl/bio.h
++++ b/include/openssl/bio.h
+@@ -194,6 +194,10 @@ OPENSSL_EXPORT int BIO_should_io_special(const BIO *bio);
+  * a private key for a TLS connection. */
+ #define BIO_RR_SSL_CHANNEL_ID_LOOKUP 0x04
+ 
++/* BIO_RR_SSL_CHANNEL_ID_SIGNATURE indicates that the ChannelID code cannot find
++ * the digest for a TLS connection. */
++#define BIO_RR_SSL_CHANNEL_ID_SIGNATURE 0x05
++
+ /* BIO_get_retry_reason returns the special I/O operation that needs to be
+  * retried. The return value is one of the |BIO_RR_*| values. */
+ OPENSSL_EXPORT int BIO_get_retry_reason(const BIO *bio);
+diff --git a/include/openssl/ecdsa.h b/include/openssl/ecdsa.h
+index f3f68eb..717c21a 100644
+--- a/include/openssl/ecdsa.h
++++ b/include/openssl/ecdsa.h
+@@ -106,6 +106,10 @@ OPENSSL_EXPORT ECDSA_SIG *ECDSA_SIG_new(void);
+ /* ECDSA_SIG_free frees |sig| its member |BIGNUM|s. */
+ OPENSSL_EXPORT void ECDSA_SIG_free(ECDSA_SIG *sig);
+ 
++/* ECDSA_SIG_copy returns a fresh |ECDSA_SIG| initialized to the contents of
++   |signature| or NULL on error. */
++OPENSSL_EXPORT ECDSA_SIG *ECDSA_SIG_copy(ECDSA_SIG *signature);
++
+ /* ECDSA_do_sign signs |digest_len| bytes from |digest| with |key| and returns
+  * the resulting signature structure, or NULL on error. */
+ OPENSSL_EXPORT ECDSA_SIG *ECDSA_do_sign(const uint8_t *digest,
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+index bce981c..9844f24 100644
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -468,6 +468,11 @@ OPENSSL_EXPORT int SSL_get_error(const SSL *ssl, int ret_code);
+  * See also |SSL_set_private_key_method|. */
+ #define SSL_ERROR_WANT_PRIVATE_KEY_OPERATION 13
+ 
++ /* SSL_ERROR_WANT_CHANNEL_ID_SIGNATURE indicates the operation failed looking
++ * up the Channel ID signature. The caller may retry the operation when one
++ * has been configured with |SSL_set1_tls_channel_id_signature|. */
++#define SSL_ERROR_WANT_CHANNEL_ID_SIGNATURE 14
++
+ /* SSL_set_mtu sets the |ssl|'s MTU in DTLS to |mtu|. It returns one on success
+  * and zero on failure. */
+ OPENSSL_EXPORT int SSL_set_mtu(SSL *ssl, unsigned mtu);
+@@ -2337,6 +2342,28 @@ OPENSSL_EXPORT int SSL_set1_tls_channel_id(SSL *ssl, EVP_PKEY *private_key);
+ OPENSSL_EXPORT size_t SSL_get_tls_channel_id(SSL *ssl, uint8_t *out,
+                                              size_t max_out);
+ 
++/* SSL_get_tls_channel_id_digest copies the digest that the channel ID will
++ * be used to sign. It returns one on success and zero on error. */
++OPENSSL_EXPORT int SSL_get_tls_channel_id_digest(SSL *ssl, uint8_t *out);
++
++/* SSL_set1_tls_channel_id_signature configures a TLS client to send a TLS Channel ID to
++ * compatible servers. It returns one on success and zero on error. */
++OPENSSL_EXPORT int SSL_set1_tls_channel_id_signature(SSL *ssl, ECDSA_SIG *signature);
++
++/* SSL_set1_tls_channel_id_public_key configures a TLS client to send a TLS Channel ID to
++ * compatible servers. It returns one on success and zero on error. */
++OPENSSL_EXPORT int SSL_set1_tls_channel_id_public_key(SSL *ssl, EVP_PKEY *public_key);
++
++/* SSL_CTX_set1_tls_channel_id_signature configures a TLS client to send a TLS Channel ID
++ * to compatible servers. It returns one on success and zero on error. */
++OPENSSL_EXPORT int SSL_CTX_set1_tls_channel_id_signature(SSL_CTX *ctx,
++               ECDSA_SIG *signature);
++
++/* SSL_set1_tls_channel_id_digest configures a TLS client to send a TLS Channel ID to
++ * compatible servers. It returns one on success and zero on error. */
++OPENSSL_EXPORT int SSL_set1_tls_channel_id_digest(SSL *ssl, uint8_t *digest,
++              size_t digest_len);
++
+ /* SSL_CTX_set_channel_id_cb sets a callback to be called when a TLS Channel ID
+  * is requested. The callback may set |*out_pkey| to a key, passing a reference
+  * to the caller. If none is returned, the handshake will pause and
+@@ -3188,6 +3215,7 @@ OPENSSL_EXPORT int (*SSL_CTX_get_client_cert_cb(SSL_CTX *ctx))(
+ #define SSL_PENDING_SESSION 7
+ #define SSL_CERTIFICATE_SELECTION_PENDING 8
+ #define SSL_PRIVATE_KEY_OPERATION 9
++#define SSL_CHANNEL_ID_SIGNATURE 10
+ 
+ /* SSL_want returns one of the above values to determine what the most recent
+  * operation on |ssl| was blocked on. Use |SSL_get_error| instead. */
+@@ -3198,6 +3226,8 @@ OPENSSL_EXPORT int SSL_want(const SSL *ssl);
+ #define SSL_want_write(ssl) (SSL_want(ssl) == SSL_WRITING)
+ #define SSL_want_x509_lookup(ssl) (SSL_want(ssl) == SSL_X509_LOOKUP)
+ #define SSL_want_channel_id_lookup(ssl) (SSL_want(ssl) == SSL_CHANNEL_ID_LOOKUP)
++#define SSL_want_channel_id_signature(ssl) \
++  (SSL_want(ssl) == SSL_CHANNEL_ID_SIGNATURE)
+ #define SSL_want_session(ssl) (SSL_want(ssl) == SSL_PENDING_SESSION)
+ #define SSL_want_certificate(ssl) \
+   (SSL_want(ssl) == SSL_CERTIFICATE_SELECTION_PENDING)
+@@ -3666,6 +3696,18 @@ struct ssl_ctx_st {
+   /* The client's Channel ID private key. */
+   EVP_PKEY *tlsext_channel_id_private;
+ 
++  /* The client's signature over the Channel ID digest. */
++  ECDSA_SIG *tlsext_channel_id_signature;
++
++  /* The client's Channel ID public key. */
++  EVP_PKEY *tlsext_channel_id_public_key;
++
++  /* The digest for the client to sign using the Channel ID private key. */
++  uint8_t *tlsext_channel_id_digest;
++
++  /* The length of |tlsext_channel_id_digest|. */
++  size_t tlsext_channel_id_digest_len;
++
+   /* Signed certificate timestamp list to be sent to the client, if requested */
+   uint8_t *signed_cert_timestamp_list;
+   size_t signed_cert_timestamp_list_length;
+@@ -3847,6 +3889,18 @@ struct ssl_st {
+   /* The client's Channel ID private key. */
+   EVP_PKEY *tlsext_channel_id_private;
+ 
++  /* The client's signature over the Channel ID digest. */
++  ECDSA_SIG *tlsext_channel_id_signature;
++
++  /* The client's Channel ID public key. */
++  EVP_PKEY *tlsext_channel_id_public_key;
++
++  /* The digest for the client to sign using the Channel ID private key. */
++  uint8_t *tlsext_channel_id_digest;
++
++  /* The length of |tlsext_channel_id_digest|. */
++  size_t tlsext_channel_id_digest_len;
++
+   /* For a client, this contains the list of supported protocols in wire
+    * format. */
+   uint8_t *alpn_client_proto_list;
+@@ -4229,6 +4283,7 @@ OPENSSL_EXPORT int SSL_set_ssl_method(SSL *s, const SSL_METHOD *method);
+ #define SSL_CTX_set1_chain SSL_CTX_set1_chain
+ #define SSL_CTX_set1_curves SSL_CTX_set1_curves
+ #define SSL_CTX_set1_tls_channel_id SSL_CTX_set1_tls_channel_id
++#define SSL_CTX_set1_tls_channel_id_signature SSL_CTX_set1_tls_channel_id_signature
+ #define SSL_CTX_set_max_cert_list SSL_CTX_set_max_cert_list
+ #define SSL_CTX_set_max_send_fragment SSL_CTX_set_max_send_fragment
+ #define SSL_CTX_set_mode SSL_CTX_set_mode
+@@ -4265,6 +4320,10 @@ OPENSSL_EXPORT int SSL_set_ssl_method(SSL *s, const SSL_METHOD *method);
+ #define SSL_set1_chain SSL_set1_chain
+ #define SSL_set1_curves SSL_set1_curves
+ #define SSL_set1_tls_channel_id SSL_set1_tls_channel_id
++#define SSL_set1_tls_channel_id_signature SSL_set1_tls_channel_id_signature
++#define SSL_set1_tls_channel_id_public_key SSL_set1_tls_channel_id_public_key
++#define SSL_get_tls_channel_id_digest SSL_get_tls_channel_id_digest
++#define SSL_set1_tls_channel_id_digest SSL_set1_tls_channel_id_digest
+ #define SSL_set_max_cert_list SSL_set_max_cert_list
+ #define SSL_set_max_send_fragment SSL_set_max_send_fragment
+ #define SSL_set_mode SSL_set_mode
+diff --git a/ssl/internal.h b/ssl/internal.h
+index bbbd939..3434052 100644
+--- a/ssl/internal.h
++++ b/ssl/internal.h
+@@ -1202,6 +1202,12 @@ const EVP_MD *tls12_get_hash(uint8_t hash_alg);
+  * one on success and zero on failure. */
+ int tls1_channel_id_hash(SSL *ssl, uint8_t *out, size_t *out_len);
+ 
++/* tls1_channel_id_concat concatenates the values that will be hashed and signed by
++ * Channel ID and writes them to an allocated buffer that it places in |out|.
++ * The caller is responsible for calling |free| on |out|. It returns one on
++ * success and zero on failure. */
++int tls1_channel_id_concat(SSL *ssl, uint8_t **out, size_t *out_len);
++
+ int tls1_record_handshake_hashes_for_channel_id(SSL *s);
+ 
+ /* ssl_log_rsa_client_key_exchange logs |premaster|, if logging is enabled for
+diff --git a/ssl/s3_clnt.c b/ssl/s3_clnt.c
+index f9d7693..a96e010 100644
+--- a/ssl/s3_clnt.c
++++ b/ssl/s3_clnt.c
+@@ -171,6 +171,8 @@
+ #include "internal.h"
+ #include "../crypto/dh/internal.h"
+ 
++// Define SGX_ENABLE for sealing private keys in SGX
++#define SGX_ENABLE
+ 
+ int ssl3_connect(SSL *s) {
+   BUF_MEM *buf = NULL;
+@@ -2145,6 +2147,41 @@ int ssl3_send_channel_id(SSL *ssl) {
+ 
+   assert(ssl->state == SSL3_ST_CW_CHANNEL_ID_A);
+ 
++#ifdef SGX_ENABLE
++  if (ssl->tlsext_channel_id_signature == NULL) {
++    uint8_t *digest;
++    size_t digest_len;
++    if (!tls1_channel_id_concat(ssl, &digest, &digest_len)) {
++      return -1;
++    }
++    // this is not the digest,
++    // but rather the concatenated items that will be digested by
++    // the sgx ecdsa sign method.
++    if (!SSL_set1_tls_channel_id_digest(ssl, digest, digest_len)) {
++      return -1;
++    }
++    ssl->rwstate = SSL_CHANNEL_ID_SIGNATURE;
++    free(digest);
++    return -1;
++  }
++  ssl->rwstate = SSL_NOTHING;
++  // if the signature is set, the public key should be set as well
++  ECDSA_SIG *sig = ECDSA_SIG_copy(ssl->tlsext_channel_id_signature);
++  // |err| frees |x| and |y| and returns |ret|
++  BIGNUM *x = BN_new();
++  BIGNUM *y = BN_new();
++  int ret = -1;
++  if (!sig) {
++    goto err;
++  }
++  EC_KEY *ec_key = ssl->tlsext_channel_id_public_key->pkey.ec;
++  if (x == NULL || y == NULL ||
++      !EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(ec_key),
++                                           EC_KEY_get0_public_key(ec_key),
++                                           x, y, NULL)) {
++    goto err;
++  }
++#else
+   if (ssl->tlsext_channel_id_private == NULL &&
+       ssl->ctx->channel_id_cb != NULL) {
+     EVP_PKEY *key = NULL;
+@@ -2190,6 +2227,7 @@ int ssl3_send_channel_id(SSL *ssl) {
+   if (sig == NULL) {
+     goto err;
+   }
++#endif
+ 
+   CBB cbb, child;
+   size_t length;
+diff --git a/ssl/s3_lib.c b/ssl/s3_lib.c
+index 3f8cea0..855263e 100644
+--- a/ssl/s3_lib.c
++++ b/ssl/s3_lib.c
+@@ -358,6 +358,68 @@ size_t SSL_get_tls_channel_id(SSL *ssl, uint8_t *out, size_t max_out) {
+   return 64;
+ }
+ 
++int SSL_get_tls_channel_id_digest(SSL *ssl, uint8_t *out) {
++  memcpy(out, ssl->tlsext_channel_id_digest,
++   ssl->tlsext_channel_id_digest_len);
++  return 1;
++}
++
++int SSL_CTX_set1_tls_channel_id_signature(SSL_CTX *ctx, ECDSA_SIG *signature) {
++  if (signature == NULL) {
++    return 0;
++  }
++  ctx->tlsext_channel_id_enabled = 1;
++  ECDSA_SIG_free(ctx->tlsext_channel_id_signature);
++  ECDSA_SIG *sig = ECDSA_SIG_copy(signature);
++  if (sig == NULL) {
++    return 0;
++  }
++  ctx->tlsext_channel_id_signature = sig;
++  return 1;
++}
++
++int SSL_set1_tls_channel_id_signature(SSL *ssl, ECDSA_SIG *signature) {
++  if (signature == NULL) {
++    return 0;
++  }
++  ssl->tlsext_channel_id_enabled = 1;
++  ECDSA_SIG_free(ssl->tlsext_channel_id_signature);
++  ECDSA_SIG *sig = ECDSA_SIG_copy(signature);
++  if (sig == NULL) {
++    return 0;
++  }
++  ssl->tlsext_channel_id_signature = sig;
++  return 1;
++}
++
++int SSL_set1_tls_channel_id_public_key(SSL *ssl, EVP_PKEY *public_key) {
++  if (public_key == NULL) {
++    return 0;
++  }
++  ssl->tlsext_channel_id_enabled = 1;
++  EVP_PKEY_free(ssl->tlsext_channel_id_public_key);
++  ssl->tlsext_channel_id_public_key = EVP_PKEY_up_ref(public_key);
++  return 1;
++}
++
++int SSL_set1_tls_channel_id_digest(SSL *ssl, uint8_t *digest, size_t digest_len) {
++  if (digest == NULL) {
++    return 0;
++  }
++  ssl->tlsext_channel_id_enabled = 1;
++  if (ssl->tlsext_channel_id_digest != NULL) {
++    free(ssl->tlsext_channel_id_digest);
++  }
++  uint8_t *dig = calloc(digest_len, sizeof(uint8_t));
++  if (dig == NULL) {
++    return 0;
++  }
++  memcpy(dig, digest, digest_len);
++  ssl->tlsext_channel_id_digest = dig;
++  ssl->tlsext_channel_id_digest_len = digest_len;
++  return 1;
++}
++
+ int SSL_set_tlsext_host_name(SSL *ssl, const char *name) {
+   OPENSSL_free(ssl->tlsext_hostname);
+   ssl->tlsext_hostname = NULL;
+diff --git a/ssl/ssl_lib.c b/ssl/ssl_lib.c
+index beb57ad..1d81062 100644
+--- a/ssl/ssl_lib.c
++++ b/ssl/ssl_lib.c
+@@ -339,6 +339,11 @@ void SSL_CTX_free(SSL_CTX *ctx) {
+   OPENSSL_free(ctx->ocsp_response);
+   OPENSSL_free(ctx->signed_cert_timestamp_list);
+   EVP_PKEY_free(ctx->tlsext_channel_id_private);
++  ECDSA_SIG_free(ctx->tlsext_channel_id_signature);
++  EVP_PKEY_free(ctx->tlsext_channel_id_public_key);
++  if (ctx->tlsext_channel_id_digest != NULL) {
++    free(ctx->tlsext_channel_id_digest);
++  }
+ 
+   OPENSSL_free(ctx);
+ }
+@@ -442,6 +447,31 @@ SSL *SSL_new(SSL_CTX *ctx) {
+         EVP_PKEY_up_ref(ctx->tlsext_channel_id_private);
+   }
+ 
++  if (ctx->tlsext_channel_id_signature) {
++    ECDSA_SIG *sig = ECDSA_SIG_copy(ctx->tlsext_channel_id_signature);
++    if (sig == NULL) {
++      goto err;
++    }
++    s->tlsext_channel_id_signature = sig;
++  }
++  if (ctx->tlsext_channel_id_public_key) {
++    EVP_PKEY *key = EVP_PKEY_new();
++    if (key == NULL) {
++      goto err;
++    }
++    EVP_PKEY_copy_parameters(key, ctx->tlsext_channel_id_public_key);
++    s->tlsext_channel_id_public_key = key;
++  }
++  if (ctx->tlsext_channel_id_digest) {
++    uint8_t *dig = calloc(ctx->tlsext_channel_id_digest_len, sizeof(uint8_t));
++    if (dig == NULL) {
++      goto err;
++    }
++    memcpy(dig, ctx->tlsext_channel_id_digest, ctx->tlsext_channel_id_digest_len);
++    s->tlsext_channel_id_digest = dig;
++    s->tlsext_channel_id_digest_len = ctx->tlsext_channel_id_digest_len;
++  }
++
+   s->signed_cert_timestamps_enabled = s->ctx->signed_cert_timestamps_enabled;
+   s->ocsp_stapling_enabled = s->ctx->ocsp_stapling_enabled;
+ 
+@@ -496,6 +526,11 @@ void SSL_free(SSL *ssl) {
+   OPENSSL_free(ssl->tlsext_ellipticcurvelist);
+   OPENSSL_free(ssl->alpn_client_proto_list);
+   EVP_PKEY_free(ssl->tlsext_channel_id_private);
++  ECDSA_SIG_free(ssl->tlsext_channel_id_signature);
++  EVP_PKEY_free(ssl->tlsext_channel_id_public_key);
++  if (ssl->tlsext_channel_id_digest != NULL) {
++    free(ssl->tlsext_channel_id_digest);
++  }
+   OPENSSL_free(ssl->psk_identity_hint);
+   sk_X509_NAME_pop_free(ssl->client_CA, X509_NAME_free);
+   OPENSSL_free(ssl->next_proto_negotiated);
+@@ -793,6 +828,10 @@ int SSL_get_error(const SSL *ssl, int ret_code) {
+     return SSL_ERROR_WANT_CHANNEL_ID_LOOKUP;
+   }
+ 
++  if (SSL_want_channel_id_signature(ssl)) {
++    return SSL_ERROR_WANT_CHANNEL_ID_SIGNATURE;
++  }
++
+   if (SSL_want_private_key_operation(ssl)) {
+     return SSL_ERROR_WANT_PRIVATE_KEY_OPERATION;
+   }
+diff --git a/ssl/t1_lib.c b/ssl/t1_lib.c
+index c0ef97e..1112f0b 100644
+--- a/ssl/t1_lib.c
++++ b/ssl/t1_lib.c
+@@ -2881,6 +2881,54 @@ err:
+   return ret;
+ }
+ 
++// caller must free |out|
++int tls1_channel_id_concat(SSL *ssl, uint8_t **out, size_t *out_len) {
++  int ret = 0;
++  // calculate total_length of output
++  static const char kClientIDMagic[] = "TLS Channel ID signature";
++  size_t total_length = sizeof(kClientIDMagic);
++  static const char kResumptionMagic[] = "Resumption";
++  if (ssl->hit) {
++    total_length += sizeof(kResumptionMagic);
++    if (ssl->session->original_handshake_hash_len == 0) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      goto err;
++    }
++    total_length += ssl->session->original_handshake_hash_len;
++  }
++  uint8_t handshake_hash[EVP_MAX_MD_SIZE];
++  int handshake_hash_len = tls1_handshake_digest(ssl, handshake_hash,
++                                                 sizeof(handshake_hash));
++  if (handshake_hash_len < 0) {
++    goto err;
++  }
++  total_length += (size_t)handshake_hash_len;
++  // allocate total_length memory
++  uint8_t *output = malloc(total_length);
++  if (!output) {
++    goto err;
++  }
++  *out_len = sizeof(kClientIDMagic);
++  memcpy(output, kClientIDMagic, *out_len);
++  if (ssl->hit) {
++    memcpy(&output[*out_len], kResumptionMagic, sizeof(kResumptionMagic));
++    *out_len += sizeof(kResumptionMagic);
++    memcpy(&output[*out_len], ssl->session->original_handshake_hash,
++                     ssl->session->original_handshake_hash_len);
++    *out_len += ssl->session->original_handshake_hash_len;
++  }
++  memcpy(&output[*out_len], handshake_hash, (size_t)handshake_hash_len);
++  *out_len += (size_t)handshake_hash_len;
++  if (*out_len != total_length) {
++    free(output);
++    goto err;
++  }
++  *out = output;
++  ret = 1;
++err:
++  return ret;
++}
++
+ /* tls1_record_handshake_hashes_for_channel_id records the current handshake
+  * hashes in |s->session| so that Channel ID resumptions can sign that data. */
+ int tls1_record_handshake_hashes_for_channel_id(SSL *s) {
+-- 
+2.8.0.rc3.226.g39d4020
+
