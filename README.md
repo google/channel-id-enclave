@@ -2,10 +2,11 @@
 
 ## About
 
-These patches enable Chromium to store its Channel ID private keys in an
-Intel SGX enclave. The BoringSSL patch enables an opaque key for Channel ID, and
-the Chromium patch enables an opaque key along with providing an implementation
-of hardware-backed keys using the Intel SGX SDK.
+There are two related patches in this project: The BoringSSL patch enables an
+opaque key for Channel ID, and the Chromium patch enables an opaque key along
+with providing an implementation of hardware-backed keys using the Intel SGX
+SDK. Together, these patches demonstrate how Chromium could store its Channel ID
+private keys in an Intel SGX enclave.
 
 ## Compile and run
 
