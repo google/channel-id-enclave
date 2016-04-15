@@ -27,7 +27,7 @@ cd build/linux/debian_wheezy_<amd64/i386>-sysroot/
 mkdir opt && cd opt && mkdir intel && cd intel
 cp -r /opt/intel/sgxsdk .
 ```
-9. Set up pkgconfig, by creating the file `/usr/lib/pkgconfig/sgx.pc` with contents:
+9. Set up pkgconfig by creating the file `/usr/lib/pkgconfig/sgx.pc` with contents:
 
 ```
 prefix=/opt/intel/sgxsdk
